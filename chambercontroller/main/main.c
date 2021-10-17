@@ -32,6 +32,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -44,6 +45,7 @@
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
 #include <lwip/netdb.h>
+#include "dht11.h"
 
 /* The examples use simple configuration that you can set via
    project configuration.
@@ -78,6 +80,21 @@ static const char *V4TAG = "mcast-ipv4";
 static const char *V6TAG = "mcast-ipv6";
 #endif
 
+struct configs{
+    int humidifieron;
+    int heateron;
+};
+
+struct chamberdata{
+    int humidity;
+    int temp;
+};
+
+#define CONFIG_HTTP_BYTE_SIZE 16
+#define CHAMBER_DATA_BYTE_SIZE 16
+SemaphoreHandle_t configlock = NULL;
+struct configs configvals;
+struct chamberdata chamberdatavals;
 
 #ifdef CONFIG_EXAMPLE_IPV4
 /* Add a socket, either IPV4-only or IPV6 dual mode, to the IPV4
@@ -328,22 +345,23 @@ err:
 }
 #endif
 
+static int get_humidity(){
+    return 1999;
+}
+
+static int get_temp(){
+    return 1337;
+}
+
 static void mcast_example_task(void *pvParameters)
 {
     while (1) {
         int sock;
 
-#ifdef CONFIG_EXAMPLE_IPV4_ONLY
         sock = create_multicast_ipv4_socket();
         if (sock < 0) {
             ESP_LOGE(TAG, "Failed to create IPv4 multicast socket");
         }
-#else
-        sock = create_multicast_ipv6_socket();
-        if (sock < 0) {
-            ESP_LOGE(TAG, "Failed to create IPv6 multicast socket");
-        }
-#endif
 
         if (sock < 0) {
             // Nothing to do!
@@ -351,7 +369,6 @@ static void mcast_example_task(void *pvParameters)
             continue;
         }
 
-#ifdef CONFIG_EXAMPLE_IPV4
         // set destination multicast addresses for sending from these sockets
         struct sockaddr_in sdestv4 = {
             .sin_family = PF_INET,
@@ -359,82 +376,20 @@ static void mcast_example_task(void *pvParameters)
         };
         // We know this inet_aton will pass because we did it above already
         inet_aton(MULTICAST_IPV4_ADDR, &sdestv4.sin_addr.s_addr);
-#endif
 
-#ifdef CONFIG_EXAMPLE_IPV6
-        struct sockaddr_in6 sdestv6 = {
-            .sin6_family = PF_INET6,
-            .sin6_port = htons(UDP_PORT),
-        };
-        // We know this inet_aton will pass because we did it above already
-        inet6_aton(MULTICAST_IPV6_ADDR, &sdestv6.sin6_addr);
-#endif
 
         // Loop waiting for UDP received, and sending UDP packets if we don't
         // see any.
         int err = 1;
+        u_int32_t last_packet_sendtime = 0;
+        u_int32_t packet_interval = 2;
         while (err > 0) {
-            struct timeval tv = {
-                .tv_sec = 2,
-                .tv_usec = 0,
-            };
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(sock, &rfds);
-
-            int s = select(sock + 1, &rfds, NULL, NULL, &tv);
-            if (s < 0) {
-                ESP_LOGE(TAG, "Select failed: errno %d", errno);
-                err = -1;
-                break;
-            }
-            else if (s > 0) {
-                if (FD_ISSET(sock, &rfds)) {
-                    // Incoming datagram received
-                    char recvbuf[48];
-                    char raddr_name[32] = { 0 };
-
-                    struct sockaddr_storage raddr; // Large enough for both IPv4 or IPv6
-                    socklen_t socklen = sizeof(raddr);
-                    int len = recvfrom(sock, recvbuf, sizeof(recvbuf)-1, 0,
-                                       (struct sockaddr *)&raddr, &socklen);
-                    if (len < 0) {
-                        ESP_LOGE(TAG, "multicast recvfrom failed: errno %d", errno);
-                        err = -1;
-                        break;
-                    }
-
-                    // Get the sender's address as a string
-#ifdef CONFIG_EXAMPLE_IPV4
-                    if (raddr.ss_family == PF_INET) {
-                        inet_ntoa_r(((struct sockaddr_in *)&raddr)->sin_addr,
-                                    raddr_name, sizeof(raddr_name)-1);
-                    }
-#endif
-#ifdef CONFIG_EXAMPLE_IPV6
-                    if (raddr.ss_family== PF_INET6) {
-                        inet6_ntoa_r(((struct sockaddr_in6 *)&raddr)->sin6_addr, raddr_name, sizeof(raddr_name)-1);
-                    }
-#endif
-                    ESP_LOGI(TAG, "received %d bytes from %s:", len, raddr_name);
-
-                    recvbuf[len] = 0; // Null-terminate whatever we received and treat like a string...
-                    ESP_LOGI(TAG, "%s", recvbuf);
-                }
-            }
-            else { // s == 0
+            if ( (esp_log_timestamp() - last_packet_sendtime)/1000 > packet_interval) {
                 // Timeout passed with no incoming data, so send something!
-                static int send_count;
-                const char sendfmt[] = "Multicast #%d sent by ESP32\n";
-                char sendbuf[48];
+                char * chamberdataptr = (char*)(&chamberdatavals);
+                char sendbuf[CHAMBER_DATA_BYTE_SIZE];
                 char addrbuf[32] = { 0 };
-                int len = snprintf(sendbuf, sizeof(sendbuf), sendfmt, send_count++);
-                if (len > sizeof(sendbuf)) {
-                    ESP_LOGE(TAG, "Overflowed multicast sendfmt buffer!!");
-                    send_count = 0;
-                    err = -1;
-                    break;
-                }
+                memcpy(sendbuf, chamberdataptr,CHAMBER_DATA_BYTE_SIZE);
 
                 struct addrinfo hints = {
                     .ai_flags = AI_PASSIVE,
@@ -442,14 +397,7 @@ static void mcast_example_task(void *pvParameters)
                 };
                 struct addrinfo *res;
 
-#ifdef CONFIG_EXAMPLE_IPV4 // Send an IPv4 multicast packet
-
-#ifdef CONFIG_EXAMPLE_IPV4_ONLY
                 hints.ai_family = AF_INET; // For an IPv4 socket
-#else
-                hints.ai_family = AF_INET6; // For an IPv4 socket with V4 mapped addresses
-                hints.ai_flags |= AI_V4MAPPED;
-#endif
                 int err = getaddrinfo(CONFIG_EXAMPLE_MULTICAST_IPV4_ADDR,
                                       NULL,
                                       &hints,
@@ -462,53 +410,29 @@ static void mcast_example_task(void *pvParameters)
                     ESP_LOGE(TAG, "getaddrinfo() did not return any addresses");
                     break;
                 }
-#ifdef CONFIG_EXAMPLE_IPV4_ONLY
                 ((struct sockaddr_in *)res->ai_addr)->sin_port = htons(UDP_PORT);
                 inet_ntoa_r(((struct sockaddr_in *)res->ai_addr)->sin_addr, addrbuf, sizeof(addrbuf)-1);
                 ESP_LOGI(TAG, "Sending to IPV4 multicast address %s:%d...",  addrbuf, UDP_PORT);
-#else
-                ((struct sockaddr_in6 *)res->ai_addr)->sin6_port = htons(UDP_PORT);
-                inet6_ntoa_r(((struct sockaddr_in6 *)res->ai_addr)->sin6_addr, addrbuf, sizeof(addrbuf)-1);
-                ESP_LOGI(TAG, "Sending to IPV6 (V4 mapped) multicast address %s port %d (%s)...",  addrbuf, UDP_PORT, CONFIG_EXAMPLE_MULTICAST_IPV4_ADDR);
-#endif
-                err = sendto(sock, sendbuf, len, 0, res->ai_addr, res->ai_addrlen);
+                err = sendto(sock, sendbuf, CHAMBER_DATA_BYTE_SIZE, 0, res->ai_addr, res->ai_addrlen);
                 freeaddrinfo(res);
                 if (err < 0) {
                     ESP_LOGE(TAG, "IPV4 sendto failed. errno: %d", errno);
                     break;
                 }
-#endif
-#ifdef CONFIG_EXAMPLE_IPV6
-                hints.ai_family = AF_INET6;
-                hints.ai_protocol = 0;
-                err = getaddrinfo(CONFIG_EXAMPLE_MULTICAST_IPV6_ADDR,
-                                  NULL,
-                                  &hints,
-                                  &res);
-                if (err < 0) {
-                    ESP_LOGE(TAG, "getaddrinfo() failed for IPV6 destination address. error: %d", err);
-                    break;
-                }
-
-                struct sockaddr_in6 *s6addr = (struct sockaddr_in6 *)res->ai_addr;
-                s6addr->sin6_port = htons(UDP_PORT);
-                inet6_ntoa_r(s6addr->sin6_addr, addrbuf, sizeof(addrbuf)-1);
-                ESP_LOGI(TAG, "Sending to IPV6 multicast address %s port %d...",  addrbuf, UDP_PORT);
-                err = sendto(sock, sendbuf, len, 0, res->ai_addr, res->ai_addrlen);
-                freeaddrinfo(res);
-                if (err < 0) {
-                    ESP_LOGE(TAG, "IPV6 sendto failed. errno: %d", errno);
-                    break;
-                }
-#endif
+                last_packet_sendtime = esp_log_timestamp();
+            } else { // s == 0
+                ESP_LOGI(TAG, "GETTING HUMIDITY");
+                chamberdatavals.humidity = DHT11_read().humidity;
+                chamberdatavals.temp     = DHT11_read().temperature;
+                ESP_LOGI(TAG, "readings; humidity: %d, temp: %d...",  chamberdatavals.humidity , chamberdatavals.temp );
+                vTaskDelay(100/portTICK_PERIOD_MS);
             }
         }
 
-        ESP_LOGE(TAG, "Shutting down socket and restarting...");
-        shutdown(sock, 0);
-        close(sock);
+    ESP_LOGE(TAG, "Shutting down socket and restarting...");
+    shutdown(sock, 0);
+    close(sock);
     }
-
 }
 
 /* A simple example that demonstrates how to create GET and POST
@@ -724,6 +648,8 @@ static esp_err_t echo_post_handler(httpd_req_t *req)
 {
     char buf[100];
     int ret, remaining = req->content_len;
+    char * configbuf = (char*)(&configvals);
+    int written = 0;
 
     while (remaining > 0) {
         /* Read the data for the request */
@@ -735,10 +661,17 @@ static esp_err_t echo_post_handler(httpd_req_t *req)
             }
             return ESP_FAIL;
         }
-
         /* Send back the same data */
         httpd_resp_send_chunk(req, buf, ret);
         remaining -= ret;
+        if(written < CONFIG_HTTP_BYTE_SIZE){
+            if( xSemaphoreTake( configlock, ( TickType_t ) 10 ) == pdTRUE )
+            {
+                memcpy(configbuf + written,buf,MIN(sizeof(buf),CONFIG_HTTP_BYTE_SIZE - written));
+                xSemaphoreGive( configlock );
+                written += ret;
+            }
+        }
 
         /* Log data received */
         ESP_LOGI(TAG, "=========== RECEIVED DATA ==========");
@@ -882,21 +815,26 @@ static void connect_handler(void* arg, esp_event_base_t event_base,
 
 void app_main(void)
 {
+    DHT11_init(GPIO_NUM_4);
+
+/*
+    printf("Starting\n");
+    while(1) {
+        printf("Temperature is %d \n", DHT11_read().temperature);
+        printf("Humidity is %d\n", DHT11_read().humidity);
+        printf("Status code is %d\n", DHT11_read().status);
+        vTaskDelay(1000/portTICK_PERIOD_MS);
+    }
+    */
+
     static httpd_handle_t server = NULL;
 
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
-     * Read "Establishing Wi-Fi or Ethernet Connection" section in
-     * examples/protocols/README.md for more information about this function.
-     */
     ESP_ERROR_CHECK(example_connect());
 
-    /* Register event handlers to stop the server when Wi-Fi or Ethernet is disconnected,
-     * and re-start it upon connection.
-     */
 #ifdef CONFIG_EXAMPLE_CONNECT_WIFI
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &connect_handler, &server));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &disconnect_handler, &server));
@@ -908,7 +846,7 @@ void app_main(void)
 
 
 
-    xTaskCreate(&mcast_example_task, "mcast_task", 4096, NULL, 5, NULL);
-    /* Start the server for the first time */
+    configlock = xSemaphoreCreateMutex();
+    xTaskCreate(&mcast_example_task, "mcast_task", 4096, NULL, configMAX_PRIORITIES - 1, NULL);
     server = start_webserver();
 }
