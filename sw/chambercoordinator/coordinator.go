@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -8,10 +9,31 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"encoding/binary"
+	"time"
 
 	"golang.org/x/net/ipv4"
+	"github.com/jackc/pgx/v4"
 )
 
+func loaddata(humidity uint32, temperture uint32) {
+	urlExample := "postgres://postgres:password@172.17.0.2:5432/mushroomkingdom"
+	sqlStatement := `
+	INSERT INTO sensordata (time, chamberid, humidity, temperature)
+	VALUES ($1, $2, $3, $4)
+	`
+	chamberid := 5
+	time := time.Now().Unix()
+	conn, err := pgx.Connect(context.Background(), urlExample)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
+		os.Exit(1)
+	}
+	defer conn.Close(context.Background())
+
+	conn.QueryRow(context.Background(),sqlStatement, time,chamberid,humidity,temperture)
+
+}
 func main() {
 	prog := "mcast_listener"
 
@@ -112,6 +134,11 @@ func mcastOpen(bindAddr net.IP, port int, ifname string) (*ipv4.PacketConn, erro
 	return p, nil
 }
 
+type readdata struct{
+	humidity int
+	temperture int
+}
+
 func readLoop(c *ipv4.PacketConn) {
 
 	log.Printf("readLoop: reading")
@@ -139,6 +166,10 @@ func readLoop(c *ipv4.PacketConn) {
 		}
 
 		log.Printf("readLoop: recv %d bytes from %s to %s on %s", n, cm.Src, cm.Dst, name)
+		humidityreading := binary.LittleEndian.Uint32(buf[0:4])
+		tempreading     := binary.LittleEndian.Uint32(buf[4:8])
+		loaddata(humidityreading,tempreading)
+		log.Printf("%d %d", humidityreading, tempreading)
 	}
 
 	log.Printf("readLoop: exiting")
